@@ -2,11 +2,16 @@ import os
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Dict, Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from database import db, create_document, get_documents
+
+import httpx
+
+# Optional: OpenAI for chat assistant
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 app = FastAPI(title="Wellbeing MVP API")
 
@@ -223,11 +228,39 @@ def analyze_text(text: str) -> Dict[str, Any]:
 
 
 # -----------------------------
+# OpenAI-powered chat (upgrade path)
+# -----------------------------
+
+async def llm_reply(messages: List[Dict[str, str]]) -> str:
+    if not OPENAI_API_KEY:
+        # fallback to template if no key configured
+        last = messages[-1]["content"] if messages else ""
+        return generate_supportive_reply(last, analyze_text(last))
+
+    # Using OpenAI responses API via httpx for portability
+    url = "https://api.openai.com/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+    payload = {
+        "model": "gpt-4o-mini",
+        "temperature": 0.7,
+        "messages": [
+            {"role": "system", "content": "You are a kid-safe wellbeing assistant. Be brief, supportive, and avoid medical advice. Encourage reaching out to a trusted adult for serious issues."},
+            *messages,
+        ],
+    }
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.post(url, headers=headers, json=payload)
+        r.raise_for_status()
+        data = r.json()
+        return data["choices"][0]["message"]["content"]
+
+
+# -----------------------------
 # Chat endpoint with analysis and risk scoring
 # -----------------------------
 
 @app.post("/chat")
-def chat(req: ChatRequest):
+async def chat(req: ChatRequest):
     # Analyze message
     analysis = analyze_text(req.text)
 
@@ -246,12 +279,12 @@ def chat(req: ChatRequest):
     # Update rolling risk
     score = update_risk(req.userId, analysis["risk"])
 
-    # Generate a supportive assistant reply (template-based MVP)
-    reply = generate_supportive_reply(req.text, analysis)
+    # Generate a supportive assistant reply (OpenAI if configured)
+    reply_text = await llm_reply([{ "role": "user", "content": req.text }])
     reply_doc = {
         "userId": req.userId,
         "role": "assistant",
-        "text": reply,
+        "text": reply_text,
         "emotions": ["support"],
         "sentiment": "positive",
         "risk": 0.0,
@@ -263,7 +296,7 @@ def chat(req: ChatRequest):
     alert_level = maybe_create_alert(req.userId, score)
 
     return {
-        "reply": reply,
+        "reply": reply_text,
         "analysis": analysis,
         "riskScore": score,
         "alertLevel": alert_level,
@@ -378,7 +411,7 @@ def get_timer(child_id: str):
 
 
 # -----------------------------
-# Social links and activity (MVP mock tracking)
+# Social links and activity
 # -----------------------------
 
 @app.post("/social/link")
@@ -407,9 +440,9 @@ def get_social_links(child_id: str):
     ]
 
 
+# MVP mock scan (existing)
 @app.post("/social/{child_id}/scan")
 def scan_social(child_id: str):
-    # For MVP: generate a handful of mock posts per link and analyze them
     links = list(db["sociallink"].find({"childId": child_id}))
     if not links:
         raise HTTPException(status_code=404, detail="No social links configured for this child")
@@ -440,15 +473,22 @@ def scan_social(child_id: str):
     if activities:
         db["socialactivity"].insert_many(activities)
 
-    # Update aggregated risk (slight nudge if many negative posts)
     avg_risk = sum(act["risk"] for act in activities) / max(1, len(activities))
     _ = update_risk(child_id, avg_risk)
     return {"count": len(activities), "avgRisk": avg_risk}
 
 
+# Instagram scraping placeholder: requires official API in production
+@app.post("/social/{child_id}/scan/instagram")
+def scan_instagram(child_id: str, handle: str = Form(...)):
+    # This endpoint documents the legit path: use Meta Graph API with user consent.
+    # Here we store an intent record and return a message instructing to connect OAuth in future phase.
+    create_document("socialscanrequest", {"childId": child_id, "provider": "instagram", "handle": handle, "created_at": now_iso()})
+    return {"ok": True, "message": "Instagram scan requires OAuth (Meta Graph API). Connect account to enable real scans."}
+
+
 @app.get("/social/{child_id}/activity")
 def get_social_activity(child_id: str):
-    # Return recent 15 activities
     cur = db["socialactivity"].find({"childId": child_id}).sort("_id", -1).limit(15)
     items = list(cur)
     return [
@@ -462,6 +502,57 @@ def get_social_activity(child_id: str):
         }
         for it in items
     ]
+
+
+# -----------------------------
+# Safety: Deepfake detection (placeholder)
+# -----------------------------
+
+@app.post("/safety/deepfake/detect")
+async def detect_deepfake(file: UploadFile = File(...)):
+    # Placeholder: basic metadata-based heuristic. In production, integrate a vision model/API.
+    content = await file.read()
+    size_kb = len(content) / 1024
+    ext = (file.filename or "").split(".")[-1].lower()
+    score = 0.0
+    # naive heuristics
+    if ext in {"mp4", "mov", "avi", "mkv"}:
+        score += 15
+    if ext in {"jpg", "jpeg", "png", "webp"}:
+        score += 5
+    if size_kb > 5120:  # 5MB
+        score += 10
+    score = clamp(score, 0, 100)
+    result = {"filename": file.filename, "sizeKB": round(size_kb, 1), "suspicion": score, "label": "likely" if score>=60 else ("uncertain" if score>=30 else "unlikely")}
+    create_document("deepfakedetect", {**result, "created_at": now_iso()})
+    return result
+
+
+# -----------------------------
+# Reporting
+# -----------------------------
+
+class ReportRequest(BaseModel):
+    reporterId: str
+    targetUserId: Optional[str] = None
+    reason: str
+    note: Optional[str] = None
+    context: Optional[Dict[str, Any]] = None
+
+
+@app.post("/report")
+def submit_report(req: ReportRequest):
+    doc = {
+        "reporterId": req.reporterId,
+        "targetUserId": req.targetUserId,
+        "reason": req.reason,
+        "note": req.note,
+        "context": req.context or {},
+        "created_at": now_iso(),
+        "status": "open",
+    }
+    report_id = create_document("report", doc)
+    return {"ok": True, "reportId": report_id}
 
 
 if __name__ == "__main__":
