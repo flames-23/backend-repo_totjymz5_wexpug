@@ -60,6 +60,12 @@ class TimerSetRequest(BaseModel):
     sessionLimit: int
 
 
+class SocialLinkRequest(BaseModel):
+    childId: str
+    provider: str
+    handle: str
+
+
 # -----------------------------
 # Root and health
 # -----------------------------
@@ -117,7 +123,8 @@ def register(req: RegisterRequest):
     # Link child to parent if provided
     if role == "child" and req.parentId:
         try:
-            db["user"].update_one({"_id": db.ObjectId(req.parentId)}, {"$addToSet": {"children": user_id}})
+            from bson import ObjectId
+            db["user"].update_one({"_id": ObjectId(req.parentId)}, {"$addToSet": {"children": user_id}})
         except Exception:
             pass
     return {"userId": user_id, "role": role}
@@ -287,7 +294,6 @@ def generate_supportive_reply(text: str, analysis: Dict[str, Any]) -> str:
 # -----------------------------
 
 def update_risk(user_id: str, current_risk: float) -> float:
-    from bson import ObjectId
     existing = db["riskstate"].find_one({"userId": user_id})
     decay = 0.85  # keep some memory
     new_score = current_risk if not existing else clamp(existing.get("score", 0) * decay + current_risk * (1 - decay) + (10 if current_risk >= 60 else 0), 0, 100)
@@ -369,6 +375,93 @@ def get_timer(child_id: str):
         "dailyLimit": int(t.get("dailyLimit", 60)),
         "sessionLimit": int(t.get("sessionLimit", 20)),
     }
+
+
+# -----------------------------
+# Social links and activity (MVP mock tracking)
+# -----------------------------
+
+@app.post("/social/link")
+def link_social(req: SocialLinkRequest):
+    # Upsert a social link document per child+provider
+    doc = {
+        "childId": req.childId,
+        "provider": req.provider.lower(),
+        "handle": req.handle,
+        "updated_at": now_iso(),
+    }
+    db["sociallink"].update_one(
+        {"childId": req.childId, "provider": doc["provider"]},
+        {"$set": doc},
+        upsert=True,
+    )
+    return {"ok": True}
+
+
+@app.get("/social/{child_id}/links")
+def get_social_links(child_id: str):
+    links = list(db["sociallink"].find({"childId": child_id}))
+    return [
+        {"childId": l.get("childId"), "provider": l.get("provider"), "handle": l.get("handle")}
+        for l in links
+    ]
+
+
+@app.post("/social/{child_id}/scan")
+def scan_social(child_id: str):
+    # For MVP: generate a handful of mock posts per link and analyze them
+    links = list(db["sociallink"].find({"childId": child_id}))
+    if not links:
+        raise HTTPException(status_code=404, detail="No social links configured for this child")
+
+    samples = [
+        "Had a great day at school, proud of my project!",
+        "Feeling lonely today...",
+        "That test made me so anxious",
+        "I love my new bike",
+        "Sometimes I just want to disappear",
+        "Hanging out with friends made me happy",
+    ]
+    import random
+    activities: List[Dict[str, Any]] = []
+    for l in links:
+        for _ in range(3):
+            text = random.choice(samples)
+            a = analyze_text(text)
+            activities.append({
+                "childId": child_id,
+                "provider": l.get("provider"),
+                "handle": l.get("handle"),
+                "text": text,
+                "analysis": a,
+                "risk": a["risk"],
+                "created_at": now_iso(),
+            })
+    if activities:
+        db["socialactivity"].insert_many(activities)
+
+    # Update aggregated risk (slight nudge if many negative posts)
+    avg_risk = sum(act["risk"] for act in activities) / max(1, len(activities))
+    _ = update_risk(child_id, avg_risk)
+    return {"count": len(activities), "avgRisk": avg_risk}
+
+
+@app.get("/social/{child_id}/activity")
+def get_social_activity(child_id: str):
+    # Return recent 15 activities
+    cur = db["socialactivity"].find({"childId": child_id}).sort("_id", -1).limit(15)
+    items = list(cur)
+    return [
+        {
+            "provider": it.get("provider"),
+            "handle": it.get("handle"),
+            "text": it.get("text"),
+            "analysis": it.get("analysis", {}),
+            "risk": float(it.get("risk", 0)),
+            "created_at": it.get("created_at"),
+        }
+        for it in items
+    ]
 
 
 if __name__ == "__main__":
