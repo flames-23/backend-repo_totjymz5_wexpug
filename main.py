@@ -1,8 +1,14 @@
 import os
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
+from datetime import datetime, timezone, timedelta
+from typing import Optional, List, Dict, Any
 
-app = FastAPI()
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+from database import db, create_document, get_documents
+
+app = FastAPI(title="Wellbeing MVP API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -12,57 +18,357 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# -----------------------------
+# Utility helpers
+# -----------------------------
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def clamp(v: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, v))
+
+
+# -----------------------------
+# Schemas for requests
+# -----------------------------
+
+class RegisterRequest(BaseModel):
+    role: str
+    name: str
+    email: Optional[str] = None
+    parentId: Optional[str] = None
+    pin: Optional[str] = None
+
+
+class LoginRequest(BaseModel):
+    role: str
+    email: Optional[str] = None
+    pin: Optional[str] = None
+    userId: Optional[str] = None
+
+
+class ChatRequest(BaseModel):
+    userId: str
+    text: str
+
+
+class TimerSetRequest(BaseModel):
+    childId: str
+    dailyLimit: int
+    sessionLimit: int
+
+
+# -----------------------------
+# Root and health
+# -----------------------------
+
 @app.get("/")
 def read_root():
-    return {"message": "Hello from FastAPI Backend!"}
+    return {"message": "Wellbeing MVP API running"}
 
-@app.get("/api/hello")
-def hello():
-    return {"message": "Hello from the backend API!"}
 
 @app.get("/test")
 def test_database():
-    """Test endpoint to check if database is available and accessible"""
     response = {
         "backend": "✅ Running",
         "database": "❌ Not Available",
-        "database_url": None,
-        "database_name": None,
+        "database_url": "✅ Set" if os.getenv("DATABASE_URL") else "❌ Not Set",
+        "database_name": "✅ Set" if os.getenv("DATABASE_NAME") else "❌ Not Set",
         "connection_status": "Not Connected",
         "collections": []
     }
-    
     try:
-        # Try to import database module
-        from database import db
-        
         if db is not None:
             response["database"] = "✅ Available"
-            response["database_url"] = "✅ Configured"
-            response["database_name"] = db.name if hasattr(db, 'name') else "✅ Connected"
             response["connection_status"] = "Connected"
-            
-            # Try to list collections to verify connectivity
             try:
-                collections = db.list_collection_names()
-                response["collections"] = collections[:10]  # Show first 10 collections
+                response["collections"] = db.list_collection_names()[:10]
                 response["database"] = "✅ Connected & Working"
             except Exception as e:
-                response["database"] = f"⚠️  Connected but Error: {str(e)[:50]}"
+                response["database"] = f"⚠️ Connected but Error: {str(e)[:80]}"
         else:
-            response["database"] = "⚠️  Available but not initialized"
-            
-    except ImportError:
-        response["database"] = "❌ Database module not found (run enable-database first)"
+            response["database"] = "⚠️ Available but not initialized"
     except Exception as e:
-        response["database"] = f"❌ Error: {str(e)[:50]}"
-    
-    # Check environment variables
-    import os
-    response["database_url"] = "✅ Set" if os.getenv("DATABASE_URL") else "❌ Not Set"
-    response["database_name"] = "✅ Set" if os.getenv("DATABASE_NAME") else "❌ Not Set"
-    
+        response["database"] = f"❌ Error: {str(e)[:100]}"
     return response
+
+
+# -----------------------------
+# Auth (very simple MVP)
+# -----------------------------
+
+@app.post("/auth/register")
+def register(req: RegisterRequest):
+    role = req.role.lower()
+    if role not in ["parent", "child"]:
+        raise HTTPException(status_code=400, detail="role must be 'parent' or 'child'")
+    user_doc = {
+        "role": role,
+        "name": req.name,
+        "email": req.email,
+        "parentId": req.parentId,
+        "children": [],
+        "pin": req.pin,
+        "created_at": now_iso(),
+    }
+    user_id = create_document("user", user_doc)
+    # Link child to parent if provided
+    if role == "child" and req.parentId:
+        try:
+            db["user"].update_one({"_id": db.ObjectId(req.parentId)}, {"$addToSet": {"children": user_id}})
+        except Exception:
+            pass
+    return {"userId": user_id, "role": role}
+
+
+@app.post("/auth/login")
+def login(req: LoginRequest):
+    # Parent: by email, Child: by userId or PIN (MVP only)
+    query: Dict[str, Any] = {}
+    if req.userId:
+        try:
+            from bson import ObjectId
+            query["_id"] = ObjectId(req.userId)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid userId")
+    elif req.role == "parent" and req.email:
+        query = {"role": "parent", "email": req.email}
+    elif req.role == "child" and req.pin:
+        query = {"role": "child", "pin": req.pin}
+    else:
+        raise HTTPException(status_code=400, detail="Provide userId, or email (parent), or pin (child)")
+
+    user = db["user"].find_one(query)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"userId": str(user["_id"]), "role": user.get("role"), "name": user.get("name")}
+
+
+# -----------------------------
+# Positive content (static lists for MVP)
+# -----------------------------
+
+AFFIRMATIONS = [
+    "You are brave and capable.",
+    "Every day you learn and grow.",
+    "You can do hard things.",
+]
+QUOTES = [
+    "The secret of getting ahead is getting started. — Mark Twain",
+    "It always seems impossible until it's done. — Nelson Mandela",
+    "Believe you can and you're halfway there. — Theodore Roosevelt",
+]
+JOKES = [
+    "Why did the kid bring a ladder to school? Because they wanted to go to high school!",
+    "What do you call a bear with no teeth? A gummy bear!",
+    "Why was the math book sad? It had too many problems!",
+]
+
+@app.get("/content/daily")
+def daily_content():
+    import random
+    return {
+        "affirmation": random.choice(AFFIRMATIONS),
+        "quote": random.choice(QUOTES),
+        "joke": random.choice(JOKES),
+    }
+
+
+# -----------------------------
+# Simple emotion + risk analyzer (rule-based MVP)
+# -----------------------------
+
+NEGATIVE_WORDS = {
+    "sad", "upset", "angry", "anxious", "lonely", "tired", "worried", "scared", "depressed",
+}
+POSITIVE_WORDS = {"happy", "excited", "proud", "grateful", "calm", "good", "love"}
+SELF_HARM_WORDS = {
+    "suicide", "kill myself", "end it", "self harm", "cut myself", "die", "hurt myself",
+}
+EMOTION_MAP = {
+    "joy": POSITIVE_WORDS,
+    "sadness": {"sad", "depressed", "cry", "lonely"},
+    "anger": {"angry", "mad", "hate"},
+    "fear": {"scared", "afraid", "worried", "anxious"},
+}
+
+
+def analyze_text(text: str) -> Dict[str, Any]:
+    t = text.lower()
+    emotions: List[str] = []
+    for label, words in EMOTION_MAP.items():
+        if any(w in t for w in words):
+            emotions.append(label)
+    pos = sum(1 for w in POSITIVE_WORDS if w in t)
+    neg = sum(1 for w in NEGATIVE_WORDS if w in t)
+    sentiment = "positive" if pos > neg else ("negative" if neg > pos else "neutral")
+
+    risk = 0.0
+    if any(w in t for w in SELF_HARM_WORDS):
+        risk += 80
+    risk += min(20, neg * 5)
+    risk -= min(10, pos * 3)
+    risk = clamp(risk, 0, 100)
+
+    return {"emotions": emotions, "sentiment": sentiment, "risk": risk}
+
+
+# -----------------------------
+# Chat endpoint with analysis and risk scoring
+# -----------------------------
+
+@app.post("/chat")
+def chat(req: ChatRequest):
+    # Analyze message
+    analysis = analyze_text(req.text)
+
+    # Save user message
+    msg_doc = {
+        "userId": req.userId,
+        "role": "user",
+        "text": req.text,
+        "emotions": analysis["emotions"],
+        "sentiment": analysis["sentiment"],
+        "risk": analysis["risk"],
+        "created_at": now_iso(),
+    }
+    _ = create_document("message", msg_doc)
+
+    # Update rolling risk
+    score = update_risk(req.userId, analysis["risk"])
+
+    # Generate a supportive assistant reply (template-based MVP)
+    reply = generate_supportive_reply(req.text, analysis)
+    reply_doc = {
+        "userId": req.userId,
+        "role": "assistant",
+        "text": reply,
+        "emotions": ["support"],
+        "sentiment": "positive",
+        "risk": 0.0,
+        "created_at": now_iso(),
+    }
+    _ = create_document("message", reply_doc)
+
+    # Check alert thresholds
+    alert_level = maybe_create_alert(req.userId, score)
+
+    return {
+        "reply": reply,
+        "analysis": analysis,
+        "riskScore": score,
+        "alertLevel": alert_level,
+    }
+
+
+def generate_supportive_reply(text: str, analysis: Dict[str, Any]) -> str:
+    if analysis["risk"] >= 80:
+        return (
+            "I'm really sorry you're feeling this way. You are not alone and you deserve help. "
+            "I'm alerting your parent/guardian so they can support you. If you are in immediate danger, "
+            "please call your local emergency number right now."
+        )
+    if analysis["sentiment"] == "negative":
+        return (
+            "Thanks for sharing how you feel. Let's try a 30-second breathing exercise together. "
+            "Inhale for 4, hold for 4, exhale for 6. You are safe here. Would you like a joke or an affirmation?"
+        )
+    if analysis["sentiment"] == "neutral":
+        return (
+            "Got it! I'm here to help with anything. Want to do a quick focus session or hear a quote?"
+        )
+    return "That's awesome! I'm proud of you. Want to keep the good vibes going with a fun joke or a new goal?"
+
+
+# -----------------------------
+# Risk state management and alerts
+# -----------------------------
+
+def update_risk(user_id: str, current_risk: float) -> float:
+    from bson import ObjectId
+    existing = db["riskstate"].find_one({"userId": user_id})
+    decay = 0.85  # keep some memory
+    new_score = current_risk if not existing else clamp(existing.get("score", 0) * decay + current_risk * (1 - decay) + (10 if current_risk >= 60 else 0), 0, 100)
+    db["riskstate"].update_one(
+        {"userId": user_id},
+        {"$set": {"userId": user_id, "score": new_score, "updated_at": now_iso()}, "$push": {"history": {"$each": [new_score], "$slice": -50}}},
+        upsert=True,
+    )
+    return float(new_score)
+
+
+@app.get("/risk/{user_id}")
+def get_risk(user_id: str):
+    state = db["riskstate"].find_one({"userId": user_id})
+    return {"userId": user_id, "score": float(state.get("score", 0)) if state else 0.0}
+
+
+def maybe_create_alert(user_id: str, score: float) -> Optional[str]:
+    # Thresholds
+    level: Optional[str] = None
+    if score >= 80:
+        level = "critical"
+    elif score >= 60:
+        level = "concern"
+    elif score >= 30:
+        level = "info"
+
+    if not level:
+        return None
+
+    # Check cooldown (12h)
+    rs = db["riskstate"].find_one({"userId": user_id})
+    last = None
+    if rs and rs.get("lastAlertAt"):
+        try:
+            last = datetime.fromisoformat(rs["lastAlertAt"])
+        except Exception:
+            last = None
+    if last and datetime.now(timezone.utc) - last < timedelta(hours=12) and level != "critical":
+        return level
+
+    alert = {
+        "userId": user_id,
+        "level": level,
+        "summary": f"Risk level {level.upper()} detected at {now_iso()} with score {int(score)}.",
+        "channels": ["log"],
+        "sentAt": now_iso(),
+        "acknowledged": False,
+    }
+    _ = create_document("alert", alert)
+    db["riskstate"].update_one({"userId": user_id}, {"$set": {"lastAlertAt": now_iso()}})
+    return level
+
+
+# -----------------------------
+# Timer endpoints (in-app limits)
+# -----------------------------
+
+@app.post("/timers/set")
+def set_timer(req: TimerSetRequest):
+    # Upsert timer document for child
+    doc = {
+        "childId": req.childId,
+        "dailyLimit": req.dailyLimit,
+        "sessionLimit": req.sessionLimit,
+        "updated_at": now_iso(),
+    }
+    db["timer"].update_one({"childId": req.childId}, {"$set": doc}, upsert=True)
+    return {"ok": True}
+
+
+@app.get("/timers/{child_id}")
+def get_timer(child_id: str):
+    t = db["timer"].find_one({"childId": child_id})
+    if not t:
+        return {"childId": child_id, "dailyLimit": 60, "sessionLimit": 20}
+    return {
+        "childId": child_id,
+        "dailyLimit": int(t.get("dailyLimit", 60)),
+        "sessionLimit": int(t.get("sessionLimit", 20)),
+    }
 
 
 if __name__ == "__main__":
